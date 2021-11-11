@@ -4047,13 +4047,13 @@ derive_ec_key(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE key, CK_MECHANISM_TYPE
 	int n_attrs = 9;
 	CK_ECDH1_DERIVE_PARAMS ecdh_parms;
 	CK_RV rv;
-	BIO *bio_in = NULL;
 	EC_KEY  *eckey = NULL;
 	EVP_PKEY *pkey = NULL;
-	const EC_GROUP *ecgroup = NULL;
-	const EC_POINT *ecpoint = NULL;
+	FILE *keyfile = NULL;
+	const EC_GROUP *peer_ecgroup = NULL;
+	const EC_POINT *peer_ecpoint = NULL;
 	unsigned char *buf = NULL;
-	size_t buf_size = 0;
+	size_t buf_len = 0;
 	CK_ULONG key_len = 0;
 	ASN1_OCTET_STRING *octet = NULL;
 	unsigned char * der = NULL;
