@@ -4049,6 +4049,7 @@ derive_ec_key(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE key, CK_MECHANISM_TYPE
 	CK_RV rv;
 	BIO *bio_in = NULL;
 	EC_KEY  *eckey = NULL;
+	EVP_PKEY *pkey = NULL;
 	const EC_GROUP *ecgroup = NULL;
 	const EC_POINT *ecpoint = NULL;
 	unsigned char *buf = NULL;
@@ -4058,83 +4059,116 @@ derive_ec_key(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE key, CK_MECHANISM_TYPE
 	unsigned char * der = NULL;
 	unsigned char * derp = NULL;
 	size_t  der_size = 0;
-
+	int peer_ktype;
+    	
 	printf("Using derive algorithm 0x%8.8lx %s\n", opt_mechanism, p11_mechanism_to_name(mech_mech));
-	memset(&mech, 0, sizeof(mech));
-	mech.mechanism = mech_mech;
+        memset(&mech, 0, sizeof(mech));
+        mech.mechanism = mech_mech;
 
-	/*  Use OpenSSL to read the other public key, and get the raw version */
-	bio_in = BIO_new(BIO_s_file());
-	if (BIO_read_filename(bio_in, opt_input) <= 0)
-		util_fatal("Cannot open %s: %m", opt_input);
+        /*  Use OpenSSL to read the other public key */
+        printf("reading in: %s \n", opt_input);
+        keyfile = fopen(opt_input, "r");
+        pkey = PEM_read_PUBKEY(keyfile, NULL, NULL, NULL);
+        if (pkey == NULL)
+                util_fatal("Cannot open %s: %m", opt_input);
 
-	eckey = d2i_EC_PUBKEY_bio(bio_in, NULL);
-	if (!eckey)
-		util_fatal("Cannot read EC key from %s", opt_input);
+        fclose(keyfile);
+        /* Get EVP key type */
+        peer_ktype = EVP_PKEY_base_id(pkey);
 
-	ecpoint = EC_KEY_get0_public_key(eckey);
-	ecgroup = EC_KEY_get0_group(eckey);
+        printf("got ktype: %d\n",peer_ktype);
 
-	if (!ecpoint || !ecgroup)
-		util_fatal("Failed to parse other EC key from %s", opt_input);
+        /* Get the buffer length for the key type */
+        if (peer_ktype == EVP_PKEY_EC) {
+                eckey = EVP_PKEY_get0_EC_KEY(pkey);
+                peer_ecpoint = EC_KEY_get0_public_key(eckey);
+                peer_ecgroup = EC_KEY_get0_group(eckey);
+                if (!peer_ecpoint || !peer_ecgroup)
+                        util_fatal("Failed to parse other EC key from %s", opt_input);
+                key_len = (EC_GROUP_get_degree(peer_ecgroup) + 7) / 8;
+                buf_len = EC_POINT_point2oct(peer_ecgroup, peer_ecpoint, POINT_CONVERSION_UNCOMPRESSED, NULL, 0, NULL);
 
-	/* both eckeys must be same curve */
-	key_len = (EC_GROUP_get_degree(ecgroup) + 7) / 8;
-	FILL_ATTR(newkey_template[n_attrs], CKA_VALUE_LEN, &key_len, sizeof(key_len));
-	n_attrs++;
+                buf = (unsigned char *)malloc(buf_len);
+                if (buf == NULL) {
+                        util_fatal("malloc() failure\n");
+                }
 
-	if (opt_allowed_mechanisms_len > 0) {
-		FILL_ATTR(newkey_template[n_attrs],
-			CKA_ALLOWED_MECHANISMS, opt_allowed_mechanisms,
-			sizeof(CK_MECHANISM_TYPE) * opt_allowed_mechanisms_len);
-		n_attrs++;
-	}
+                buf_len = EC_POINT_point2oct(peer_ecgroup, peer_ecpoint, POINT_CONVERSION_UNCOMPRESSED, buf, buf_len, NULL);
 
-	buf_size = EC_POINT_point2oct(ecgroup, ecpoint, POINT_CONVERSION_UNCOMPRESSED, NULL,	    0, NULL);
-	buf = (unsigned char *)malloc(buf_size);
-	if (buf == NULL)
-	    util_fatal("malloc() failure\n");
-	buf_size = EC_POINT_point2oct(ecgroup, ecpoint, POINT_CONVERSION_UNCOMPRESSED, buf, buf_size, NULL);
+        } else if (peer_ktype == EVP_PKEY_X25519) {
+                rv = EVP_PKEY_get_raw_public_key(pkey, buf, &buf_len);
+                if (rv != 1 ) {
+                        EVP_PKEY_free(pkey);
+                        util_fatal("Failed to get raw public key length\n");
+                }
+                printf("x25519 buf len: %ld\n",buf_len);
+                buf = malloc(buf_len);
+                if (buf == NULL) {
+                        util_fatal("malloc() failure\n");
+                }
+                rv = EVP_PKEY_get_raw_public_key(pkey, buf, &buf_len);
+                if (rv != 1 ) {
+                        EVP_PKEY_free(pkey);
+                        util_fatal("Failed to get raw public key\n");
+                }
+        }
+        printf("ready to derive\n");
 
-	if (opt_derive_pass_der) {
-		octet = ASN1_OCTET_STRING_new();
-		if (octet == NULL)
-		    util_fatal("ASN1_OCTET_STRING_new failure\n");
-		ASN1_OCTET_STRING_set(octet, buf, buf_size);
-		der_size = i2d_ASN1_OCTET_STRING(octet, NULL);
-		derp = der = (unsigned char *) malloc(der_size);
-		if (der == NULL)
-			util_fatal("malloc() failure\n");
-		der_size = i2d_ASN1_OCTET_STRING(octet, &derp);
-	}
+        FILL_ATTR(newkey_template[n_attrs], CKA_VALUE_LEN, &key_len, sizeof(key_len));
+        n_attrs++;
 
-	BIO_free(bio_in);
-	EC_KEY_free(eckey);
+        printf("Key len: %ld\n", key_len);
+        printf("Buf Size: %ld\n", buf_len);
+        printf("n_attrs: %d\n", n_attrs);
 
-	memset(&ecdh_parms, 0, sizeof(ecdh_parms));
-	ecdh_parms.kdf = CKD_NULL;
-	ecdh_parms.ulSharedDataLen = 0;
-	ecdh_parms.pSharedData = NULL;
-	if (opt_derive_pass_der) {
-		ecdh_parms.ulPublicDataLen = der_size;
-		ecdh_parms.pPublicData = der;
-	} else {
-		ecdh_parms.ulPublicDataLen = buf_size;
-		ecdh_parms.pPublicData = buf;
-	}
-	mech.pParameter = &ecdh_parms;
-	mech.ulParameterLen = sizeof(ecdh_parms);
+        if (opt_allowed_mechanisms_len > 0) {
+                FILL_ATTR(newkey_template[n_attrs],
+                                CKA_ALLOWED_MECHANISMS, opt_allowed_mechanisms,
+                                sizeof(CK_MECHANISM_TYPE) * opt_allowed_mechanisms_len);
+                n_attrs++;
+        }
 
-	rv = p11->C_DeriveKey(session, &mech, key, newkey_template, n_attrs, &newkey);
-	if (rv != CKR_OK)
-	    p11_fatal("C_DeriveKey", rv);
+        if (opt_derive_pass_der) {
+                octet = ASN1_OCTET_STRING_new();
+                if (octet == NULL)
+                        util_fatal("ASN1_OCTET_STRING_new failure\n");
+                ASN1_OCTET_STRING_set(octet, buf, buf_len);
+                der_size = i2d_ASN1_OCTET_STRING(octet, NULL);
+                derp = der = (unsigned char *) malloc(der_size);
+                if (der == NULL)
+                        util_fatal("malloc() failure\n");
+                der_size = i2d_ASN1_OCTET_STRING(octet, &derp);
+        }
 
-	free(der);
-	free(buf);
-	if (octet)
-	    ASN1_OCTET_STRING_free(octet);
+        if (pkey) {
+                EVP_PKEY_free(pkey);
+        }
 
-	return newkey;
+        memset(&ecdh_parms, 0, sizeof(ecdh_parms));
+        ecdh_parms.kdf = CKD_NULL;
+        ecdh_parms.ulSharedDataLen = 0;
+        ecdh_parms.pSharedData = NULL;
+        if (opt_derive_pass_der) {
+                ecdh_parms.ulPublicDataLen = der_size;
+                ecdh_parms.pPublicData = der;
+        } else {
+                ecdh_parms.ulPublicDataLen = buf_len;
+                ecdh_parms.pPublicData = buf;
+        }
+        mech.pParameter = &ecdh_parms;
+        mech.ulParameterLen = sizeof(ecdh_parms);
+        rv = p11->C_DeriveKey(session, &mech, key, newkey_template, n_attrs, &newkey);
+        if (rv != CKR_OK)
+                p11_fatal("C_DeriveKey", rv);
+
+        free(der);
+        free(buf);
+
+        if (octet) {
+                ASN1_OCTET_STRING_free(octet);
+        }
+
+        return newkey;
 #else
 	util_fatal("Derive EC key not supported");
 	return 0;
